@@ -4,6 +4,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Silverpine.ModdingTools;
 using TMPro;
@@ -20,7 +22,7 @@ public sealed class Plugin : BaseUnityPlugin
 {
     public const string PluginGuid = "salt.silverpine.dialogueimpersonator";
     public const string PluginName = "Salt Dialogue Impersonator";
-    public const string PluginVersion = "1.2.1";
+    public const string PluginVersion = "1.4.0";
 
     private Harmony _harmony;
 
@@ -42,11 +44,11 @@ internal static class ImpersonationController
     private const string InputActorId =
         Plugin.PluginGuid + ".input-actor";
 
-    private static readonly MethodInfo GenerateDialogMethod =
+    private static readonly MethodInfo DisplayDialogTextMethod =
         AccessTools.Method(
             typeof(NeuralNPC),
-            "GenerateDialog",
-            new[] { typeof(Action), typeof(Action) }
+            "DisplayDialogText",
+            new[] { typeof(string) }
         );
 
     private static readonly MethodInfo GenerateMultiDialogMethod =
@@ -56,11 +58,41 @@ internal static class ImpersonationController
             new[] { typeof(NeuralNPC), typeof(Action), typeof(Action) }
         );
 
+    private static readonly MethodInfo DisplayMultiDialogTextMethod =
+        AccessTools.Method(
+            typeof(NeuralNPC),
+            "DisplayMultiDialogText",
+            new[]
+            {
+                typeof(NeuralNPC),
+                typeof(NeuralNPC),
+                typeof(string)
+            }
+        );
+
     private static readonly MethodInfo GetNextMultiSpeakerMethod =
         AccessTools.Method(
             typeof(NeuralNPC),
             "GetNextMultiSpeaker",
             new[] { typeof(NeuralNPC), typeof(NeuralNPC) }
+        );
+
+    private static readonly MethodInfo QueryExpressionMethod =
+        AccessTools.Method(
+            typeof(NeuralNPC),
+            "QueryExpression",
+            new[] { typeof(bool) }
+        );
+
+    private static readonly MethodInfo QueryNpcFunctionsMethod =
+        AccessTools.Method(
+            typeof(NeuralNPC),
+            "QueryNPCFunctions",
+            new[]
+            {
+                typeof(List<NPCFunction>),
+                typeof(List<NeuralNPC.DialogElement>)
+            }
         );
 
     internal static NeuralNPC SelectedNpc { get; private set; }
@@ -278,6 +310,16 @@ internal static class ImpersonationController
             return false;
         }
 
+        FinishSelectedNpcTurn();
+        HandleSingleInput(activeNpc, selectedNpc, text);
+        return true;
+    }
+
+    private static async void HandleSingleInput(
+        NeuralNPC activeNpc,
+        NeuralNPC selectedNpc,
+        string text)
+    {
         List<NeuralNPC.DialogElement> added = AddImpersonatedTurn(
             activeNpc.dialogElements,
             selectedNpc,
@@ -291,9 +333,17 @@ internal static class ImpersonationController
 
         try
         {
-            GenerateDialogMethod.Invoke(
+            await ProcessImpersonatedNpcTurn(
+                selectedNpc,
+                added.Where(element =>
+                    element.speakerType == SpeakerType.NPC).ToList(),
+                new[] { activeNpc });
+
+            string displayedTurn = added.First(element =>
+                element.speakerType == SpeakerType.NPC).contents;
+            DisplayDialogTextMethod.Invoke(
                 activeNpc,
-                new object[] { failureCallback, null }
+                new object[] { displayedTurn }
             );
         }
         catch (Exception exception)
@@ -301,8 +351,6 @@ internal static class ImpersonationController
             failureCallback();
             Notify("Could not submit impersonated dialogue: " + GetMessage(exception));
         }
-
-        return true;
     }
 
     internal static bool TryHandleMultiInput(string text)
@@ -320,6 +368,7 @@ internal static class ImpersonationController
             return false;
         }
 
+        FinishSelectedNpcTurn();
         HandleMultiInput(selectedNpc, text);
         return true;
     }
@@ -359,6 +408,18 @@ internal static class ImpersonationController
 
         try
         {
+            List<NeuralNPC.DialogElement> speakerDialogElements =
+                addedByNpc.Values
+                    .SelectMany(elements => elements)
+                    .Where(element =>
+                        element.speakerType == SpeakerType.NPC)
+                    .ToList();
+
+            await ProcessImpersonatedNpcTurn(
+                selectedNpc,
+                speakerDialogElements,
+                participants);
+
             NeuralNPC toAsk = participants.Contains(selectedNpc)
                 ? selectedNpc
                 : NeuralNPC.currentActiveDialogNeuralNPC;
@@ -374,11 +435,27 @@ internal static class ImpersonationController
             );
             NeuralNPC nextSpeaker = await nextSpeakerTask;
 
-            if (nextSpeaker == null || !participants.Contains(nextSpeaker))
+            if (nextSpeaker != null
+                && (nextSpeaker == selectedNpc
+                    || !participants.Contains(nextSpeaker)))
             {
                 nextSpeaker = participants.FirstOrDefault(
                     npc => npc != selectedNpc
-                ) ?? participants[0];
+                );
+            }
+
+            if (nextSpeaker == null)
+            {
+                string displayedTurn = speakerDialogElements[0].contents;
+                DisplayMultiDialogTextMethod.Invoke(
+                    null,
+                    new object[]
+                    {
+                        selectedNpc,
+                        null,
+                        displayedTurn
+                    });
+                return;
             }
 
             GenerateMultiDialogMethod.Invoke(
@@ -391,6 +468,54 @@ internal static class ImpersonationController
             failureCallback();
             Notify("Could not submit impersonated dialogue: " + GetMessage(exception));
         }
+    }
+
+    private static async Task ProcessImpersonatedNpcTurn(
+        NeuralNPC selectedNpc,
+        List<NeuralNPC.DialogElement> speakerDialogElements,
+        IEnumerable<NeuralNPC> participants)
+    {
+        NeuralNPC.currentActiveDialogNeuralNPC = selectedNpc;
+        selectedNpc.DoStartNPCMode(DialogBox.SpriteSwitchMode.Instant);
+
+        DialogBox.Instance.DisplayLoading(
+            "Processing " + selectedNpc.GetFinalName() + "'s turn.",
+            accessedFromInsideDialogBox: true);
+
+        var expressionTask = (Task)QueryExpressionMethod.Invoke(
+            selectedNpc,
+            new object[] { false });
+        await expressionTask;
+
+        foreach (NeuralNPC participant in participants
+            .Where(npc => npc != null)
+            .Distinct())
+        {
+            participant
+                .GetComponent<IDialogMechanic_GenerateDialogSuccess>()?
+                .OnAfterGenerateDialogSuccessCallback();
+        }
+
+        // Typed dialogue has no native API tool tags, so an empty explicit
+        // tool list makes Silverpine run its normal LLM-based NPC-function
+        // search against the selected NPC's conversation and abilities.
+        var functionTask = (Task)QueryNpcFunctionsMethod.Invoke(
+            selectedNpc,
+            new object[]
+            {
+                new List<NPCFunction>(),
+                speakerDialogElements
+            });
+        await functionTask;
+    }
+
+    private static void FinishSelectedNpcTurn()
+    {
+        // Impersonation applies to one authored NPC turn. The portrait remains
+        // pending until a genuine player line is submitted, but subsequent
+        // input belongs to the player unless they select another NPC.
+        SelectedNpc = null;
+        RefreshCurrentButton();
     }
 
     private static List<NeuralNPC.DialogElement> AddImpersonatedTurn(
@@ -454,6 +579,14 @@ internal static class ImpersonationController
             return;
         }
 
+        // Do not mirror the current right-side speaker into the player slot.
+        // The impersonated portrait stays pending and will return to the left
+        // automatically when a different NPC becomes the active speaker.
+        if (portraitNpc == NeuralNPC.currentActiveDialogNeuralNPC)
+        {
+            return;
+        }
+
         playerSprite = portraitNpc.GetDialogSprite();
         if (TryGetSilcPlayerSidePortraitPlacement(
                 portraitNpc,
@@ -468,6 +601,15 @@ internal static class ImpersonationController
         playerSpriteScale = portraitNpc.dialogSpriteScale;
         playerSpriteOffset = ConvertNpcOffsetToPlayerSide(
             portraitNpc.dialogSpriteOffset);
+    }
+
+    internal static string GetPlayerPaymentScanText(string originalText)
+    {
+        // DialogBox.SendInput parses roleplay actions and transfers the
+        // player's gold before the dialogue callback identifies its speaker.
+        // Supplying an empty scan string disables only that player-authored
+        // payment pass; the real impersonated text is left untouched.
+        return TryGetSelectedNpc(out _) ? string.Empty : originalText;
     }
 
     private static bool TryGetSilcPlayerSidePortraitPlacement(
@@ -602,6 +744,68 @@ internal static class ImpersonatedPlayerPortraitPatch
             ref playerSprite,
             ref playerSpriteScale,
             ref playerSpriteOffset);
+    }
+}
+
+[HarmonyPatch]
+internal static class ImpersonatedInputPaymentPatch
+{
+    private static MethodBase TargetMethod()
+    {
+        MethodInfo sendInput = AccessTools.Method(
+            typeof(DialogBox),
+            nameof(DialogBox.SendInput));
+        AsyncStateMachineAttribute stateMachine = sendInput
+            .GetCustomAttribute<AsyncStateMachineAttribute>();
+
+        return AccessTools.Method(stateMachine.StateMachineType, "MoveNext")
+            ?? throw new MissingMethodException(
+                "Could not find DialogBox.SendInput's async MoveNext method.");
+    }
+
+    private static IEnumerable<CodeInstruction> Transpiler(
+        IEnumerable<CodeInstruction> instructions)
+    {
+        MethodInfo inputTextGetter = AccessTools.PropertyGetter(
+            typeof(TMP_InputField),
+            nameof(TMP_InputField.text));
+        MethodInfo filterPaymentText = AccessTools.Method(
+            typeof(ImpersonationController),
+            nameof(ImpersonationController.GetPlayerPaymentScanText));
+
+        bool foundPaymentList = false;
+        bool injected = false;
+        foreach (CodeInstruction instruction in instructions)
+        {
+            yield return instruction;
+
+            if (!foundPaymentList
+                && instruction.opcode == OpCodes.Newobj
+                && instruction.operand is ConstructorInfo constructor
+                && constructor.DeclaringType == typeof(List<string>))
+            {
+                foundPaymentList = true;
+                continue;
+            }
+
+            if (foundPaymentList
+                && !injected
+                && instruction.Calls(inputTextGetter))
+            {
+                // This getter initializes SendInput's private text2 variable,
+                // which is used only by the player-gold roleplay parser.
+                yield return new CodeInstruction(
+                    OpCodes.Call,
+                    filterPaymentText);
+                injected = true;
+            }
+        }
+
+        if (!injected)
+        {
+            throw new MissingMethodException(
+                "Could not locate DialogBox.SendInput's payment scan text.");
+        }
     }
 }
 

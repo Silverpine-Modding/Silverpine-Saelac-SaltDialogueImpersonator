@@ -3,7 +3,7 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <AssemblyName>SaltDialogueImpersonator</AssemblyName>
     <Product>SaltDialogueImpersonator</Product>
-    <Version>1.2.1</Version>
+    <Version>1.4.0</Version>
     <LangVersion>latest</LangVersion>
     <RestoreAdditionalProjectSources>
       https://api.nuget.org/v3/index.json;
